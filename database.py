@@ -69,7 +69,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS interview_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            session_type TEXT NOT NULL CHECK(session_type IN ('dsa', 'hr', 'technical')),
+            session_type TEXT NOT NULL CHECK(session_type IN ('dsa', 'hr', 'technical','voice')),
             status TEXT DEFAULT 'in_progress' CHECK(status IN ('in_progress', 'completed', 'abandoned')),
             difficulty TEXT DEFAULT 'medium' CHECK(difficulty IN ('easy', 'medium', 'hard')),
             topic TEXT,

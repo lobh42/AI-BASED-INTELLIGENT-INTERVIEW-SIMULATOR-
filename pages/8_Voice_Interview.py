@@ -17,6 +17,9 @@ import threading
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+import database as db
+from browser_lock import inject_browser_lock
+from webcam_proctor import inject_webcam_proctor
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -37,132 +40,149 @@ if not st.session_state.get("user_id"):
     st.warning("Please sign in from the home page to start a voice interview.")
     st.stop()
 
-# ── Vapi key ─────────────────────────────────────────────────────────────────
+user_id = st.session_state.user_id
+
+# ── Session State ────────────────────────────────────────────────────────────
+if "voice_session_id" not in st.session_state:
+    st.session_state.voice_session_id = None
+if "voice_interview_active" not in st.session_state:
+    st.session_state.voice_interview_active = False
+
+# ── Vapi Configuration ───────────────────────────────────────────────────────
 _raw = os.getenv("VAPI_PUBLIC_KEY", "") or ""
 VAPI_PUBLIC_KEY = _raw.strip().strip('"').strip("'")
+VAPI_PORT = 8503
 
-VAPI_PORT = 8503   # local HTTP server port for the Vapi widget
-
-# ── Page header ───────────────────────────────────────────────────────────────
-st.markdown("## 💻 DSA Voice Interview")
-st.markdown("*Powered by Vapi AI — real-time voice-based DSA interview with AI interviewer Alex.*")
-st.markdown("---")
-
-
-
-# ── Key guard & debug ────────────────────────────────────────────────────────
-if not VAPI_PUBLIC_KEY:
-    st.error(
-        "\u26a0\ufe0f **`VAPI_PUBLIC_KEY` is not set.** "
-        "Add it to your `.env` file and **restart Streamlit** to pick it up."
-    )
-
-with st.expander("\U0001f50d Debug: Environment check", expanded=not VAPI_PUBLIC_KEY):
-    if VAPI_PUBLIC_KEY:
-        st.success(
-            f"\u2705 VAPI_PUBLIC_KEY is set "
-            f"({len(VAPI_PUBLIC_KEY)} chars, starts with: `{VAPI_PUBLIC_KEY[:8]}\u2026`)"
-        )
-    else:
-        st.error("\u274c VAPI_PUBLIC_KEY is empty or missing.")
-        st.code("VAPI_PUBLIC_KEY=pk_live_your_key_here", language="bash")
-        st.markdown(
-            "After editing `.env`, **stop (Ctrl+C) and re-run** `python3 -m streamlit run app.py`"
-        )
-
-# ── Build Vapi HTML page ──────────────────────────────────────────────────────
-# This HTML is served by a local HTTP server so it has a real origin,
-# allowing Daily.co (Vapi's WebRTC layer) to postMessage without CORS errors.
 VAPI_WIDGET_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Vapi Voice Interview</title>
+<title>IntervueX Voice - Alex</title>
 <style>
+  :root {
+    --primary: #6366f1;
+    --primary-glow: rgba(99, 102, 241, 0.5);
+    --bg-dark: #0f172a;
+    --glass: rgba(30, 41, 59, 0.7);
+    --text-main: #f8fafc;
+    --text-dim: #94a3b8;
+  }
+  
   * { box-sizing:border-box; margin:0; padding:0; }
   body {
-    font-family:'Segoe UI',Arial,sans-serif;
-    background:linear-gradient(135deg,#F8F9FF 0%,#EEF2FF 100%);
+    font-family:'Inter', system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);
+    color: var(--text-main);
     min-height:100vh; display:flex; flex-direction:column;
-    align-items:center; justify-content:center; gap:20px; padding:24px;
+    align-items:center; justify-content:center; gap:24px; padding:24px;
+    overflow: hidden;
   }
-  h2 { font-size:1.3rem; font-weight:800; color:#4F46E5; margin-bottom:4px; }
-  .subtitle { font-size:.85rem; color:#6B7280; margin-bottom:8px; }
 
-  .status-pill {
+  .container {
+    width: 100%; max-width: 500px;
+    background: var(--glass);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 24px;
+    padding: 32px;
+    text-align: center;
+    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
+  }
+
+  h2 { font-size:1.8rem; font-weight:800; background: linear-gradient(to right, #818cf8, #c084fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom:8px; }
+  .subtitle { font-size:.9rem; color:var(--text-dim); margin-bottom:24px; }
+
+  .orb-container {
+    position: relative; width: 140px; height: 140px; margin: 0 auto 32px;
+  }
+  .orb {
+    width: 100%; height: 100%;
+    background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+    border-radius: 50%;
+    box-shadow: 0 0 40px var(--primary-glow);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; z-index: 2;
+  }
+  .orb-pulse {
+    position: absolute; top:0; left:0; width:100%; height:100%;
+    background: var(--primary); border-radius: 50%;
+    opacity: 0.5; z-index: 1;
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  @keyframes pulse {
+    0% { transform: scale(1); opacity: 0.5; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+
+  .status-badge {
     display:inline-flex; align-items:center; gap:8px;
-    padding:8px 24px; border-radius:999px;
-    font-size:.9rem; font-weight:700; transition:all .3s;
+    padding:8px 16px; border-radius:99px;
+    font-size:.85rem; font-weight:600; margin-bottom: 24px;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
   }
-  .idle    { background:rgba(107,114,128,.1); color:#6B7280; border:1.5px solid #D1D5DB; }
-  .loading { background:rgba(251,191,36,.15); color:#B45309; border:1.5px solid #FBBF24; }
-  .active  { background:rgba(52,211,153,.15); color:#047857; border:1.5px solid #34D399; animation:glow 1.8s infinite; }
-  .error   { background:rgba(239,68,68,.1);   color:#B91C1C; border:1.5px solid #FCA5A5; }
-  @keyframes glow {
-    0%,100% { box-shadow:0 0 0 0 rgba(52,211,153,.5); }
-    50%      { box-shadow:0 0 0 10px rgba(52,211,153,0); }
-  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+  .active .status-dot { background: #10b981; box-shadow: 0 0 10px #10b981; }
 
-  .controls { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
+  .controls { display:flex; gap:16px; justify-content:center; }
   .btn {
-    display:inline-flex; align-items:center; gap:8px;
-    padding:14px 36px; border-radius:14px; border:none;
-    font-size:1rem; font-weight:700; cursor:pointer;
-    transition:transform .15s, box-shadow .15s, opacity .2s;
+    padding: 14px 28px; border-radius: 14px; border: none;
+    font-size: 1rem; font-weight: 700; cursor: pointer;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: inline-flex; align-items: center; gap: 8px;
   }
-  .btn:hover:not(:disabled) { transform:translateY(-2px); box-shadow:0 6px 24px rgba(0,0,0,.2); }
-  .btn:disabled { opacity:.4; cursor:not-allowed; }
-  .btn-start { background:linear-gradient(135deg,#4F46E5,#7C3AED); color:#fff; }
-  .btn-stop  { background:linear-gradient(135deg,#EF4444,#DC2626); color:#fff; }
+  .btn-start { background: #6366f1; color: white; box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4); }
+  .btn-start:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(99, 102, 241, 0.6); }
+  .btn-stop { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+  .btn-stop:hover:not(:disabled) { background: #ef4444; color: white; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
 
-  .transcript-box {
-    width:100%; max-width:600px;
-    background:#fff; border:1px solid #E5E7EB; border-radius:14px;
-    padding:16px; min-height:80px; max-height:220px; overflow-y:auto;
-    font-size:.87rem; color:#374151; line-height:1.6;
-    box-shadow:0 2px 8px rgba(0,0,0,.06);
-    display:none;
+  .transcript {
+    margin-top: 32px; padding: 16px; background: rgba(0,0,0,0.2);
+    border-radius: 16px; max-height: 120px; overflow-y: auto;
+    font-size: 0.9rem; color: var(--text-dim); line-height: 1.5;
+    text-align: left; display: none;
   }
-  .transcript-box .t-label { font-weight:800; color:#4F46E5; margin-bottom:8px; font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; }
+  .transcript strong { color: #818cf8; }
 
-  #errorMsg {
-    color:#B91C1C; font-size:.84rem; text-align:center;
-    background:rgba(239,68,68,.08); border:1px solid #FCA5A5;
-    border-radius:10px; padding:10px 16px; display:none; max-width:520px;
-  }
-  .tip { font-size:.78rem; color:#9CA3AF; text-align:center; }
+  #error { color: #f87171; font-size: 0.85rem; margin-top: 16px; display: none; }
 </style>
 </head>
 <body>
 
-<div style="text-align:center;">
-  <h2>&#127899;&#65039; IntervueX Voice Interview</h2>
-  <div class="subtitle">AI Interviewer &bull; DSA &amp; HR &bull; Real-Time</div>
+<div class="container">
+  <h2>Alex AI Interviewer</h2>
+  <p class="subtitle">AI Technical Recruiter &bull; Real-time Voice</p>
+
+  <div class="orb-container">
+    <div id="orbPulse" class="orb-pulse" style="display:none;"></div>
+    <div class="orb">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+        <line x1="12" y1="19" x2="12" y2="23"></line>
+        <line x1="8" y1="23" x2="16" y2="23"></line>
+      </svg>
+    </div>
+  </div>
+
+  <div id="statusBadge" class="status-badge">
+    <div id="statusDot" class="status-dot"></div>
+    <span id="statusText">Ready to start</span>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn" class="btn btn-start" onclick="startInterview()">
+      Start Interview
+    </button>
+    <button id="stopBtn" class="btn btn-stop" onclick="stopInterview()" disabled>
+      End Call
+    </button>
+  </div>
+
+  <div id="transcript" class="transcript"></div>
+  <div id="error"></div>
 </div>
-
-<div id="statusPill" class="status-pill idle">
-  <span id="statusDot">&#9898;</span>
-  <span id="statusText">Ready to start</span>
-</div>
-
-<div class="controls">
-  <button id="startBtn" class="btn btn-start" onclick="startInterview()">
-    &#127899;&#65039; Start Voice Interview
-  </button>
-  <button id="stopBtn" class="btn btn-stop" onclick="stopInterview()" disabled>
-    &#9209; Stop Interview
-  </button>
-</div>
-
-<div class="transcript-box" id="transcriptBox">
-  <div class="t-label">&#128172; Live Transcript</div>
-  <div id="transcriptContent"></div>
-</div>
-
-<div id="errorMsg"></div>
-
-<div class="tip">Grant microphone access when prompted &bull; Chrome/Edge recommended</div>
 
 <script type="module">
   import Vapi from 'https://esm.sh/@vapi-ai/web@latest';
@@ -172,169 +192,169 @@ VAPI_WIDGET_HTML = """<!DOCTYPE html>
 
   const $ = id => document.getElementById(id);
 
-  function setStatus(mode, text) {
-    const pill = $('statusPill');
-    pill.className = 'status-pill ' + mode;
-    $('statusDot').innerHTML = {idle:'&#9898;',loading:'&#128993;',active:'&#128994;',error:'&#128308;'}[mode] || '&#9898;';
+  function updateStatus(text, mode) {
     $('statusText').textContent = text;
-  }
-
-  function showError(msg) {
-    const el = $('errorMsg');
-    el.style.display = 'block';
-    el.innerHTML = '&#9888;&#65039; ' + msg;
-    setStatus('error', 'Error');
-    $('startBtn').disabled = false;
-    $('stopBtn').disabled = true;
-    active = false;
-  }
-
-  function addLine(speaker, text) {
-    if (!text) return;
-    const box = $('transcriptBox');
-    box.style.display = 'block';
-    const line = document.createElement('div');
-    line.style.marginBottom = '5px';
-    const isAI = speaker === 'assistant';
-    line.innerHTML =
-      '<strong style="color:' + (isAI ? '#4F46E5' : '#059669') + ';">' +
-      (isAI ? '&#129302; Alex' : '&#128100; You') + ':</strong> ' + text;
-    $('transcriptContent').appendChild(line);
-    box.scrollTop = box.scrollHeight;
+    $('statusBadge').className = 'status-badge ' + mode;
+    $('orbPulse').style.display = (mode === 'active') ? 'block' : 'none';
   }
 
   async function startInterview() {
-    if (!KEY) { showError('VAPI_PUBLIC_KEY not set. Edit .env and restart Streamlit.'); return; }
+    if (!KEY) { $('error').textContent = 'API Key missing'; return; }
     $('startBtn').disabled = true;
-    $('errorMsg').style.display = 'none';
-    setStatus('loading', 'Connecting\u2026');
+    updateStatus('Connecting...', 'loading');
 
     try {
       vapi = new Vapi(KEY);
 
       vapi.on('call-start', () => {
         active = true;
-        setStatus('active', 'Live \u2014 Interview in progress');
+        updateStatus('Live Interview', 'active');
         $('stopBtn').disabled = false;
-        $('transcriptBox').style.display = 'block';
-        $('transcriptContent').innerHTML = '';
+        $('transcript').style.display = 'block';
       });
 
       vapi.on('call-end', () => {
         active = false;
-        setStatus('idle', 'Interview ended \u2014 Good job!');
+        updateStatus('Ready to start', 'idle');
         $('startBtn').disabled = false;
         $('stopBtn').disabled = true;
       });
 
-      vapi.on('error', err => {
-        console.error('Vapi error:', err);
-        const msg = (err && err.message) ? err.message
-          : (err && err.error && err.error.message) ? err.error.message
-          : (typeof err === 'string') ? err
-          : 'An error occurred. Open browser console (F12) for details.';
-        showError(msg);
-      });
-
       vapi.on('message', msg => {
-        if (msg && msg.type === 'transcript') addLine(msg.role, msg.transcript);
+        if (msg.type === 'transcript') {
+          const t = $('transcript');
+          t.innerHTML = `<strong>${msg.role}:</strong> ${msg.transcript}`;
+          t.scrollTop = t.scrollHeight;
+        }
       });
-
-      vapi.on('speech-start', () => { if (active) setStatus('active', '&#129302; Alex is speaking\u2026'); });
-      vapi.on('speech-end',   () => { if (active) setStatus('active', '&#127899; Listening to you\u2026'); });
+      
+      vapi.on('error', e => {
+        console.error(e);
+        $('error').textContent = 'Connection error. Please retry.';
+        $('error').style.display = 'block';
+        updateStatus('Error', 'error');
+        $('startBtn').disabled = false;
+      });
 
       await vapi.start({
         transcriber: { provider: 'deepgram', model: 'nova-2', language: 'en-US' },
         model: {
-          provider: 'openai',
-          model: 'gpt-4o-mini',
-          temperature: 0.7,
+          provider: 'openai', model: 'gpt-4o-mini', temperature: 0.7,
           messages: [{
             role: 'system',
-            content: `You are Alex, a senior technical interviewer at a top-tier tech company.
-Conduct structured interviews covering DSA and HR/behavioural questions.
-
-Interview structure:
-1. Warm welcome (10-15 seconds).
-2. Ask 2-3 DSA questions (arrays, linked lists, trees, graphs, DP, sorting, hashing, recursion).
-3. Ask 1-2 HR questions (teamwork, conflict resolution, achievements, goals).
-4. Wrap up professionally.
-
-Guidelines:
-- Professional, encouraging, concise.
-- Let candidate finish before responding.
-- Ask follow-ups when answers are unclear.
-- Interrupt gracefully, yield when candidate speaks.
-- Keep responses under 60 words (unless explaining a solution).
-- Give brief verbal feedback after each answer.`
+            content: `You are Alex, a senior technical interviewer at a top-tier tech company. 
+            Conduct a structured, professional, and friendly interview.
+            
+            STRUCTURE:
+            1. Brief intro (15s).
+            2. Ask one DSA question at a time. Wait for answer. 
+            3. Ask follow-up/clarification if needed.
+            4. Move to next after candidate finishes.
+            5. Wrap up after 3-4 questions total.
+            
+            GUIDELINES:
+            - Keep responses under 40 words.
+            - Be encouraging but maintain high standards.
+            - Don't give answers immediately; guide the candidate.
+            - If they get stuck, give a tiny hint.`
           }]
         },
         voice: { provider: '11labs', voiceId: '21m00Tcm4TlvDq8ikWAM' },
-        name: 'IntervueX Voice Interviewer',
-        firstMessage: "Hello! I'm Alex, your interviewer today. We'll cover some DSA and HR questions. Take your time before answering. Ready to begin?"
+        name: 'Alex AI',
+        firstMessage: "Hi there! I'm Alex. Ready to dive into some technical questions?"
       });
-
-    } catch (err) {
-      console.error('startInterview threw:', err);
-      showError(err.message || 'Could not start. Check browser console (F12).');
+    } catch (e) {
+      console.error(e);
+      $('startBtn').disabled = false;
     }
   }
 
   function stopInterview() {
-    if (vapi && active) {
-      setStatus('loading', 'Ending call\u2026');
-      vapi.stop();
-    }
+    if (vapi) vapi.stop();
   }
 
   window.startInterview = startInterview;
-  window.stopInterview  = stopInterview;
+  window.stopInterview = stopInterview;
 </script>
 </body>
 </html>
 """
-
-# ── Local HTTP server (daemon thread) ─────────────────────────────────────────
-# Serves the Vapi HTML at http://localhost:8503 so it has a real origin.
-# Without a real origin, Daily.co's postMessage is blocked by the browser.
 
 def _make_vapi_html(key: str) -> bytes:
     return VAPI_WIDGET_HTML.replace("%%VAPI_KEY%%", key).encode("utf-8")
 
 def _start_vapi_server(key: str, port: int) -> None:
     import http.server
-
+    import socketserver
     html_bytes = _make_vapi_html(key)
-
     class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html_bytes)))
-            # Allow embedding in Streamlit's iframe
             self.send_header("X-Frame-Options", "ALLOWALL")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(html_bytes)
+        def log_message(self, *_): pass
+    
+    # Use allow_reuse_address to avoid "Address already in use" errors on rerun
+    socketserver.TCPServer.allow_reuse_address = True
+    try:
+        with socketserver.TCPServer(("localhost", port), Handler) as httpd:
+            httpd.serve_forever()
+    except Exception:
+        pass # Port likely busy
 
-        def log_message(self, *_):  # suppress console noise
-            pass
-
-    import socketserver
-    with socketserver.TCPServer(("localhost", port), Handler) as httpd:
-        httpd.serve_forever()
-
-
-# Start the server once per Streamlit session (daemon threads die with the process)
+# Start server once
 if "vapi_server_started" not in st.session_state:
-    t = threading.Thread(
-        target=_start_vapi_server,
-        args=(VAPI_PUBLIC_KEY, VAPI_PORT),
-        daemon=True,
-    )
+    t = threading.Thread(target=_start_vapi_server, args=(VAPI_PUBLIC_KEY, VAPI_PORT), daemon=True)
     t.start()
     st.session_state.vapi_server_started = True
 
-# ── Embed widget via real URL (fixes postMessage null-origin error) ──────────
-st.markdown("### \U0001f399\ufe0f Start Your Voice Interview")
-components.iframe(f"http://localhost:{VAPI_PORT}", height=460, scrolling=False)
+# ── Page Content ─────────────────────────────────────────────────────────────
+st.markdown("## 💻 DSA Voice Interview")
+st.markdown("*Talk to Alex — our interactive AI interviewer.*")
+st.markdown("---")
+
+if not st.session_state.voice_interview_active:
+    # Setup / Start screen
+    st.markdown("### Prepare for your Voice Interview")
+    st.info("💡 Ensure your microphone is active. Alex will ask 3-4 questions.")
+    
+    if st.button("🚀 Start Personalized Session", type="primary"):
+        # Create a database session to track violations and progress
+        session_id = db.create_session(user_id=user_id, session_type="voice")
+        st.session_state.voice_session_id = session_id
+        st.session_state.voice_interview_active = True
+        st.rerun()
+else:
+    # Active Interview Session
+    session_id = st.session_state.voice_session_id
+    
+    # Inject browser lock and webcam proctoring
+    inject_browser_lock(session_id)
+    inject_webcam_proctor(session_id)
+    
+    # Session status bar
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.markdown(f"**Session #{session_id}**")
+    with col2:
+        session_data = db.get_session(session_id)
+        violations = session_data.get("tab_violations", 0) if session_data else 0
+        if violations > 0: st.error(f"⚠️ Violations: {violations}")
+        else: st.success("✅ Clean")
+    with col3:
+        if st.button("🛑 End", type="secondary"):
+            db.complete_session(session_id)
+            st.session_state.voice_interview_active = False
+            st.switch_page("pages/5_History.py")
+
+    st.markdown("---")
+    
+    # Embed the Vapi widget
+    if not VAPI_PUBLIC_KEY:
+        st.error("`VAPI_PUBLIC_KEY` is missing in .env")
+    else:
+        components.iframe(f"http://localhost:{VAPI_PORT}", height=550, scrolling=False)
